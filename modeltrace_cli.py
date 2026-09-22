@@ -8,7 +8,7 @@
 
     python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
 
-默认通过本机 `codex exec` 发三条长整数挑战（与 candy-eval 同一调用方式），
+默认**并发**调用本机 `codex exec`（并行 3 个请求，可用 -c 调整），发长整数挑战，
 用官方 unified_bank 做闭集归因，并输出每轮输出 token / 耗时 / TPS。
 不需要配置 API base-url / key。
 
@@ -33,6 +33,7 @@ import sys
 import time
 import unicodedata
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -592,143 +593,218 @@ def setup_console() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_one_challenge(
+    index: int,
+    challenge: dict,
+    model: str | None,
+    effort: str,
+) -> dict:
+    try:
+        text, usage, elapsed = run_codex(challenge["prompt"], model, effort)
+        minimum = max(80, math.ceil(challenge["expected_count"] * 0.55))
+        numbers = parse_numbers(text)
+        parsed_count = len(numbers)
+        accepted = parsed_count >= minimum
+        out_tok = usage.get("output_tokens")
+        in_tok = usage.get("input_tokens")
+        rea_tok = usage.get("reasoning_output_tokens")
+        tps = (out_tok / elapsed) if out_tok and elapsed > 0 else None
+        return {
+            "index": index,
+            "challenge_id": challenge["id"],
+            "expected_count": challenge["expected_count"],
+            "prompt": challenge["prompt"],
+            "text": text,
+            "parsed_numbers": parsed_count,
+            "minimum_numbers": minimum,
+            "accepted": accepted,
+            "usage": usage,
+            "latency_s": elapsed,
+            "tps": tps,
+            "error": None,
+        }
+    except Exception as error:
+        return {
+            "index": index,
+            "challenge_id": challenge["id"],
+            "expected_count": challenge["expected_count"],
+            "prompt": challenge["prompt"],
+            "text": "",
+            "parsed_numbers": None,
+            "minimum_numbers": None,
+            "accepted": False,
+            "usage": {},
+            "latency_s": None,
+            "tps": None,
+            "error": str(error),
+        }
+
+
 def test_with_codex(
     model: str | None,
     effort: str,
     target_count: int,
     max_attempts: int,
     bank: dict,
+    concurrency: int = 3,
     save_outputs: Path | None = None,
 ) -> dict:
     challenges = generate_challenges(max_attempts)
-    outputs: list[dict] = []
-    perf_rows: list[list] = []
+    concurrency = max(1, min(concurrency, max_attempts))
     raw_rows: list[dict] = []
     errors: list[str] = []
+    accepted_outputs: list[dict] = []
 
     headers = ["Run", "数字", "InTok", "OutTok", "ReTok", "Time(s)", "TPS", "状态"]
     aligns = ["right", "right", "right", "right", "right", "right", "right", "center"]
 
-    def flush_table() -> None:
-        if perf_rows:
-            print(render_table(headers, perf_rows, aligns), flush=True)
+    def row_from(item: dict) -> list:
+        if item.get("error") is not None:
+            return [item["index"], "-", "-", "-", "-", "-", "-", "ERR"]
+        usage = item.get("usage") or {}
+        out_tok = usage.get("output_tokens")
+        in_tok = usage.get("input_tokens")
+        rea_tok = usage.get("reasoning_output_tokens")
+        tps = item.get("tps")
+        return [
+            item["index"],
+            item.get("parsed_numbers") or "-",
+            in_tok if in_tok is not None else "-",
+            out_tok if out_tok is not None else "-",
+            rea_tok if rea_tok is not None else "-",
+            f"{item['latency_s']:.1f}" if item.get("latency_s") is not None else "-",
+            f"{tps:.1f}" if tps else "-",
+            "✓" if item.get("accepted") else ("ERR" if item.get("error") else "✗"),
+        ]
 
-    for index, challenge in enumerate(challenges, start=1):
+    def flush_table(rows: list[dict]) -> None:
+        if not rows:
+            return
+        ordered = sorted(rows, key=lambda r: r["index"])
+        print(render_table(headers, [row_from(r) for r in ordered], aligns), flush=True)
+
+    print(f"并发启动 {concurrency} 个 codex 请求…", file=sys.stderr)
+    wall_start = time.perf_counter()
+    challenge_iter = iter(enumerate(challenges, start=1))
+    futures = {}
+
+    def submit_next(pool: ThreadPoolExecutor) -> bool:
+        try:
+            index, challenge = next(challenge_iter)
+        except StopIteration:
+            return False
         print(
-            f"[{index}/{max_attempts}] codex 挑战 {challenge['id']} "
-            f"(期望约 {challenge['expected_count']} 个数)…",
+            f"[{index}/{max_attempts}] 启动挑战 {challenge['id']} "
+            f"(期望约 {challenge['expected_count']} 个数)",
             file=sys.stderr,
         )
-        try:
-            text, usage, elapsed = run_codex(challenge["prompt"], model, effort)
-            minimum = max(80, math.ceil(challenge["expected_count"] * 0.55))
-            numbers = parse_numbers(text)
-            parsed_count = len(numbers)
-            accepted = parsed_count >= minimum
-            out_tok = usage.get("output_tokens")
-            in_tok = usage.get("input_tokens")
-            rea_tok = usage.get("reasoning_output_tokens")
-            tps = (out_tok / elapsed) if out_tok and elapsed > 0 else None
-            raw_rows.append(
-                {
-                    "challenge_id": challenge["id"],
-                    "expected_count": challenge["expected_count"],
-                    "prompt": challenge["prompt"],
-                    "text": text,
-                    "parsed_numbers": parsed_count,
-                    "minimum_numbers": minimum,
-                    "accepted": accepted,
-                    "usage": usage,
-                    "latency_s": elapsed,
-                    "tps": tps,
-                }
-            )
-            perf_rows.append(
-                [
-                    index,
-                    parsed_count,
-                    in_tok if in_tok is not None else "-",
-                    out_tok if out_tok is not None else "-",
-                    rea_tok if rea_tok is not None else "-",
-                    f"{elapsed:.1f}",
-                    f"{tps:.1f}" if tps else "-",
-                    "✓" if accepted else "✗",
-                ]
-            )
-            flush_table()
-            if accepted:
-                outputs.append(
-                    {"text": text, "expected_count": challenge["expected_count"]}
-                )
-                if tps:
-                    print(f"    接受：{parsed_count} 数字  TPS={tps:.1f}", file=sys.stderr)
-                else:
-                    print(f"    接受：{parsed_count} 数字", file=sys.stderr)
-            else:
-                errors.append(f"有效数字不足：{parsed_count}/{minimum}")
-                print(f"    拒绝：{parsed_count}/{minimum}", file=sys.stderr)
-        except Exception as error:
-            errors.append(str(error))
-            raw_rows.append(
-                {
-                    "challenge_id": challenge["id"],
-                    "expected_count": challenge["expected_count"],
-                    "prompt": challenge["prompt"],
-                    "text": "",
-                    "error": str(error),
-                }
-            )
-            perf_rows.append([index, "-", "-", "-", "-", "-", "-", "ERR"])
-            flush_table()
-            print(f"    失败：{error}", file=sys.stderr)
-        if len(outputs) == target_count:
-            break
+        futures[pool.submit(_run_one_challenge, index, challenge, model, effort)] = index
+        return True
 
-    # 汇总 token / 耗时 / TPS
+    def maybe_fill(pool: ThreadPoolExecutor) -> None:
+        # 保持最多 concurrency 路在跑，但不超过“仍缺的 有效数”
+        still_need = max(0, target_count - len(accepted_outputs) - len(futures))
+        free_slots = concurrency - len(futures)
+        for _ in range(min(free_slots, still_need)):
+            if not submit_next(pool):
+                break
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        maybe_fill(pool)
+
+        while futures:
+            done, _ = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
+            for fut in done:
+                futures.pop(fut, None)
+                item = fut.result()
+                raw_rows.append(item)
+                flush_table(raw_rows)
+                if item.get("error"):
+                    errors.append(str(item["error"]))
+                    print(f"    [{item['index']}] 失败：{item['error']}", file=sys.stderr)
+                elif item.get("accepted"):
+                    accepted_outputs.append(
+                        {
+                            "text": item["text"],
+                            "expected_count": item["expected_count"],
+                        }
+                    )
+                    tps = item.get("tps")
+                    extra = f"  TPS={tps:.1f}" if tps else ""
+                    print(
+                        f"    [{item['index']}] 接受：{item['parsed_numbers']} 数字{extra}",
+                        file=sys.stderr,
+                    )
+                else:
+                    errors.append(
+                        f"有效数字不足：{item.get('parsed_numbers')}/{item.get('minimum_numbers')}"
+                    )
+                    print(
+                        f"    [{item['index']}] 拒绝："
+                        f"{item.get('parsed_numbers')}/{item.get('minimum_numbers')}",
+                        file=sys.stderr,
+                    )
+            maybe_fill(pool)
+
+    wall_time = time.perf_counter() - wall_start
+
+    # 汇总 token / 耗时 / TPS（按完成顺序展示；表内 Run 为挑战序号）
     ok_rows = [row for row in raw_rows if row.get("accepted") and row.get("usage")]
     total_out = sum((row["usage"] or {}).get("output_tokens") or 0 for row in ok_rows)
     total_in = sum((row["usage"] or {}).get("input_tokens") or 0 for row in ok_rows)
     total_re = sum((row["usage"] or {}).get("reasoning_output_tokens") or 0 for row in ok_rows)
-    total_time = sum(row.get("latency_s") or 0.0 for row in ok_rows)
-    avg_tps = (total_out / total_time) if total_out and total_time > 0 else None
+    sum_latency = sum(row.get("latency_s") or 0.0 for row in ok_rows)
+    avg_tps = (total_out / sum_latency) if total_out and sum_latency > 0 else None
+    wall_tps = (total_out / wall_time) if total_out and wall_time > 0 else None
     performance = {
         "runs": [
             {
+                "index": row.get("index"),
                 "challenge_id": row.get("challenge_id"),
                 "parsed_numbers": row.get("parsed_numbers"),
                 "accepted": row.get("accepted"),
                 "latency_s": row.get("latency_s"),
                 "tps": row.get("tps"),
                 "usage": row.get("usage") or {},
+                "error": row.get("error"),
             }
-            for row in raw_rows
+            for row in sorted(raw_rows, key=lambda r: r.get("index") or 0)
         ],
+        "concurrency": concurrency,
         "input_tokens": total_in,
         "output_tokens": total_out,
         "reasoning_output_tokens": total_re,
-        "latency_s": total_time,
+        "latency_s": sum_latency,
+        "wall_time_s": wall_time,
         "tps": avg_tps,
+        "wall_tps": wall_tps,
     }
-    summary = f"\n性能汇总: OutTok={total_out}  ReTok={total_re}  Time={total_time:.1f}s"
+    summary = (
+        f"\n性能汇总: OutTok={total_out}  ReTok={total_re}  "
+        f"并发={concurrency}  墙钟={wall_time:.1f}s  单请求耗时和={sum_latency:.1f}s"
+    )
     if avg_tps is not None:
-        summary += f"  TPS={avg_tps:.1f}"
+        summary += f"  单请求TPS={avg_tps:.1f}"
+    if wall_tps is not None:
+        summary += f"  吞吐TPS={wall_tps:.1f}"
     print(summary, flush=True)
 
     if save_outputs is not None:
         save_outputs.parent.mkdir(parents=True, exist_ok=True)
         with save_outputs.open("w", encoding="utf-8") as handle:
-            for row in raw_rows:
+            for row in sorted(raw_rows, key=lambda r: r.get("index") or 0):
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"原始输出已写入: {save_outputs}", file=sys.stderr)
 
-    result = analyze_global_outputs(outputs, bank)
+    result = analyze_global_outputs(accepted_outputs, bank)
     result["api_test"] = {
         "requested": target_count,
         "attempted": len(raw_rows),
         "max_attempts": max_attempts,
-        "received": len(outputs),
+        "received": len(accepted_outputs),
         "errors": errors,
         "runner": "codex-cli",
+        "concurrency": concurrency,
     }
     result["performance"] = performance
     return result
@@ -764,11 +840,18 @@ def format_report(result: dict, top: int = 8) -> str:
     perf = result.get("performance") or {}
     if perf:
         tps = perf.get("tps")
+        wall_tps = perf.get("wall_tps")
+        wall = perf.get("wall_time_s", 0)
+        conc = perf.get("concurrency", 1)
         base = (
             f"输出 token: {perf.get('output_tokens', 0)}  "
-            f"耗时: {perf.get('latency_s', 0):.1f}s"
+            f"并发: {conc}  墙钟: {wall:.1f}s"
         )
-        lines.append(base + (f"  TPS: {tps:.1f}" if tps is not None else ""))
+        if tps is not None:
+            base += f"  单请求TPS: {tps:.1f}"
+        if wall_tps is not None:
+            base += f"  吞吐TPS: {wall_tps:.1f}"
+        lines.append(base)
     lines.append("")
     lines.append(f"{'模型':<28} {'概率':>8} {'家族内':>8} {'相似度':>8}")
     lines.append("-" * 56)
@@ -805,8 +888,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 直接用本地 codex，无需配置 API
+  # 直接用本地 codex，默认并发 3 路，无需配置 API
   python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
+
+  # 调整并行数
+  python modeltrace_cli.py -m gpt-5.6-sol -c 3 -n 6
 
   # 一键在线
   wget -qO- "https://raw.githubusercontent.com/you/repo/main/modeltrace_cli.py" \\
@@ -833,6 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="最多尝试几次挑战（默认 5，凑满 3 份有效回答即停）",
+    )
+    parser.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=3,
+        help="并行 codex 请求数（默认 3）",
     )
     parser.add_argument(
         "--target",
@@ -885,14 +978,15 @@ def main(argv: list[str] | None = None) -> int:
             outputs = split_manual_outputs(pasted)
             result = analyze_global_outputs(outputs, bank)
         else:
-            if args.target < 1 or args.tests < 1:
-                parser.error("-n/--tests 与 --target 至少为 1")
+            if args.target < 1 or args.tests < 1 or args.concurrency < 1:
+                parser.error("-n/--tests、-c/--concurrency 与 --target 至少为 1")
             result = test_with_codex(
                 model=args.model,
                 effort=args.reasoning_effort,
                 target_count=args.target,
                 max_attempts=max(args.tests, args.target),
                 bank=bank,
+                concurrency=args.concurrency,
                 save_outputs=args.save_outputs,
             )
     except Exception as error:
