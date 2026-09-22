@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-"""ModelTrace 终端在线评测：主动探测模型归因。
+"""ModelTrace 终端归因：调用本地 codex CLI，统计 token/耗时/TPS。
 
-把 ModelTrace（xqy2006/ModelTrace）的三条长整数挑战 + 统一指纹库归因
-收成一个零第三方依赖的单文件，可用 wget 管道直接跑：
-
-    wget -qO- "https://raw.githubusercontent.com/<you>/<repo>/main/modeltrace_cli.py" \\
-      | python3 - -m gpt-5.6-sol
+    wget -qO- "https://raw.githubusercontent.com/<you>/<repo>/main/modeltrace_cli.py" \
+      | python3 - -m gpt-5.6-sol -r medium -n 5
 
 或本地：
 
-    python modeltrace_cli.py -m gpt-5.6-sol -u https://api.example.com/v1 -k sk-...
+    python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
 
-自动模式会向 OpenAI Chat Completions / Anthropic Messages 发挑战，
-用统一指纹库做闭集归因。手动模式可粘贴/管道输入三份完整数字序列。
+默认通过本机 `codex exec` 发三条长整数挑战（与 candy-eval 同一调用方式），
+用官方 unified_bank 做闭集归因，并输出每轮输出 token / 耗时 / TPS。
+不需要配置 API base-url / key。
 
 说明：
-- 指纹库 unified_bank.json 首次运行从 GitHub raw 拉取并缓存（约 0.7MB）。
-- 结果仅供参考，不是判断模型的决定性证据；未收录模型仍会归到最相近候选。
-- 系统提示词会显著影响偏好，不建议在 Claude Code 等强系统提示环境里测。
+- 指纹库首次运行从 GitHub raw 拉取并缓存（约 0.7MB）。
+- 结果仅供参考；未收录模型仍会归到最相似候选。
+- 不建议在强系统提示环境里测（原项目说明）。
 """
 
 from __future__ import annotations
@@ -29,9 +27,11 @@ import os
 import random
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import time
-import urllib.error
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -48,13 +48,7 @@ ORDERED_FEATURE_DIM = 4 * 16 + 10  # 74
 BANK_URL_DEFAULT = (
     "https://raw.githubusercontent.com/xqy2006/ModelTrace/main/data/unified_bank.json"
 )
-DEFAULT_UPSTREAM_USER_AGENT = (
-    "Codex Desktop/0.147.0-alpha.1.2 (Windows 10.0.26200; x86_64) unknown "
-    "(codex_exec; 0.147.0-alpha.1.2)"
-)
-RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 3
-RETRY_BASE_DELAY = 1.0
+FAMILY_DISPLAY_NAMES = {"gpt": "GPT", "claude": "Claude"}
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +70,10 @@ def l2_normalize(vector: list[float]) -> list[float]:
 
 
 def mat_vec(matrix: list[list[float]], vector: list[float]) -> list[float]:
-    """matrix: (k, d) @ vector: (d,) -> (k,)"""
     return [sum(a * b for a, b in zip(row, vector)) for row in matrix]
 
 
 def project_out(vector: list[float], basis: list[list[float]]) -> list[float]:
-    """v -= (v @ B.T) @ B；basis: (rank, d)。"""
     if not basis:
         return list(vector)
     coeffs = mat_vec(basis, vector)
@@ -93,7 +85,6 @@ def project_out(vector: list[float], basis: list[list[float]]) -> list[float]:
 
 
 def array_split(values: list, parts: int) -> list[list]:
-    """等价于 numpy.array_split：前 (len % parts) 块多 1 个元素。"""
     length = len(values)
     base, extra = divmod(length, parts)
     chunks = []
@@ -106,7 +97,6 @@ def array_split(values: list, parts: int) -> list[list]:
 
 
 def histogram_16(values: list[float]) -> list[int]:
-    """等价于 np.histogram(..., bins=16, range=(1.0, 356.0))。"""
     counts = [0] * 16
     lo, hi = 1.0, 356.0
     width = (hi - lo) / 16.0
@@ -130,7 +120,7 @@ def softmax(values: list[float]) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# 指纹特征与打分（与 fingerprint.py 对齐）
+# 指纹特征与打分
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +210,6 @@ def ordered_block_scores(numbers: list[int], bank: dict) -> list[float]:
     projected = project_out(standardized_feature, artifact.get("nuisance_basis") or [])
     projected = l2_normalize(projected)
     nuisance = standardize(mat_vec(artifact["centroids"], projected))
-
     return standardize([0.5 * t + 0.5 * n for t, n in zip(template, nuisance)])
 
 
@@ -261,9 +250,6 @@ def js_similarity(left: list[int], right: list[int]) -> float:
     return 1.0 - math.sqrt(js / math.log(2.0))
 
 
-FAMILY_DISPLAY_NAMES = {"gpt": "GPT", "claude": "Claude"}
-
-
 def analyze_outputs(outputs: list[dict], bank: dict) -> dict:
     model_ids = [model["id"] for model in bank["models"]]
     valid = []
@@ -288,7 +274,7 @@ def analyze_outputs(outputs: list[dict], bank: dict) -> dict:
             valid.append({"counts": counts, "scores": components["fused"], **components})
 
     if not valid:
-        raise ValueError("没有可用回答：请粘贴完整数字序列；拒答或严重截断的回答不会计入。")
+        raise ValueError("没有可用回答：请确认 codex 输出了完整数字序列；拒答或严重截断的回答不会计入。")
 
     combined_scores = [
         sum(item["scores"][index] for item in valid) / len(valid)
@@ -301,9 +287,7 @@ def analyze_outputs(outputs: list[dict], bank: dict) -> dict:
     calibration_key = str(min(len(valid), 3))
     beta = float(bank["calibration"][calibration_key]["beta"])
     probabilities = softmax([beta * value for value in combined_scores])
-    pooled_counts = [
-        sum(item["counts"][index] for item in valid) for index in range(DIMENSION)
-    ]
+    pooled_counts = [sum(item["counts"][index] for item in valid) for index in range(DIMENSION)]
     bank_models = {model["id"]: model for model in bank["models"]}
     results = [
         {
@@ -388,7 +372,10 @@ def analyze_global_outputs(outputs: list[dict], bank: dict) -> dict:
 
 def generate_challenges(count: int = 3) -> list[dict]:
     rng = random.SystemRandom()
-    lengths = rng.sample(range(292, 333), count)
+    sample_size = min(count, 30)
+    lengths = rng.sample(range(292, 333), sample_size)
+    if count > sample_size:
+        lengths.extend(rng.randint(292, 332) for _ in range(count - sample_size))
     openings = [
         "这是一次独立的数值选择记录",
         "请完成下面的无语义整数选择任务",
@@ -457,7 +444,6 @@ def load_bank(bank_url: str = BANK_URL_DEFAULT, cache_dir: Path | None = None) -
     cache_dir.mkdir(parents=True, exist_ok=True)
     local = cache_dir / "unified_bank.json"
     local_bank = cache_dir / "unified_bank.local.json"
-    # 允许离线/自备指纹库
     for path in (local_bank, local):
         if path.exists():
             try:
@@ -478,216 +464,171 @@ def load_bank(bank_url: str = BANK_URL_DEFAULT, cache_dir: Path | None = None) -
 
 
 # ---------------------------------------------------------------------------
-# API 客户端
+# 本地 codex CLI
 # ---------------------------------------------------------------------------
 
 
-def upstream_user_agent() -> str:
-    override = (
-        os.environ.get("MODELTRACE_USER_AGENT") or os.environ.get("GPT56_USER_AGENT") or ""
-    ).strip()
-    return override or DEFAULT_UPSTREAM_USER_AGENT
-
-
-def completion_url(base_url: str, api_format: str = "openai") -> str:
-    normalized = base_url.rstrip("/")
-    if api_format == "anthropic":
-        if normalized.endswith("/messages"):
-            return normalized
-        if normalized.endswith("/v1"):
-            return normalized + "/messages"
-        return normalized + "/v1/messages"
-    if normalized.endswith("/chat/completions"):
-        return normalized
-    if normalized.endswith("/v1"):
-        return normalized + "/chat/completions"
-    return normalized + "/v1/chat/completions"
-
-
-def _looks_like_waf_block(text: str) -> bool:
-    lowered = text.lower()
-    return any(
-        marker in lowered
-        for marker in ("cloudflare", "just a moment", "cf-ray", "access denied", "attention required")
+def resolve_codex_executable() -> str:
+    """找到可被 subprocess 直接启动的 codex 命令（Windows 优先 .cmd）。"""
+    candidates = (
+        ("codex.cmd", "codex.exe", "codex")
+        if os.name == "nt"
+        else ("codex",)
     )
+    for name in candidates:
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
 
 
-def _compact_upstream_error(details: str, fallback: str) -> str:
-    text = (details or fallback or "").strip()
-    if not text:
-        return "上游接口返回错误"
-    if _looks_like_waf_block(text):
-        return (
-            "请求被上游网关拦截（Cloudflare/WAF 拦截页）。"
-            "请确认 base_url 指向 API 端点而非网页地址、API Key 有效，"
-            "或该服务是否限制当前网络/IP"
-        )
-    if text.startswith("<") or ("{" not in text and "html" in text.lower()):
-        return text[:200]
-    try:
-        payload = json.loads(text)
-        if isinstance(payload, dict):
-            error = payload.get("error")
-            if isinstance(error, dict):
-                return str(error.get("message") or error)
-            if error:
-                return str(error)
-            return json.dumps(payload, ensure_ascii=False)[:500]
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    return text[:500]
+def run_codex(prompt: str, model: str | None, effort: str) -> tuple[str, dict, float]:
+    """通过本地 codex exec 生成回答，返回 (文本, usage, 耗时秒)。"""
+    exe = resolve_codex_executable()
+    cmd = [
+        exe,
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-s",
+        "read-only",
+        # 关闭跨会话记忆，避免历史记忆污染指纹
+        "--disable",
+        "memories",
+        "-c",
+        f"model_reasoning_effort={effort}",
+    ]
+    if model:
+        cmd += ["-m", model]
 
+    start = time.perf_counter()
+    # 多行题目走 stdin，避免 cmd 包装吞换行
+    proc = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    elapsed = time.perf_counter() - start
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
 
-def _request_completion(
-    base_url: str,
-    api_key: str,
-    api_model: str,
-    prompt: str,
-    temperature: float | None,
-    api_format: str,
-    system_prompt: str = "",
-) -> str:
-    if api_format == "anthropic":
-        body_data = {
-            "model": api_model,
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        if system_prompt:
-            body_data["system"] = system_prompt
-        headers = {
-            "x-api-key": api_key,
-            "Authorization": f"Bearer {api_key}",
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": upstream_user_agent(),
-        }
-    else:
-        body_data = {
-            "model": api_model,
-            "messages": [
-                *([{"role": "system", "content": system_prompt}] if system_prompt else []),
-                {"role": "user", "content": prompt},
-            ],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": upstream_user_agent(),
-        }
-    if temperature is not None:
-        body_data["temperature"] = temperature
-    body = json.dumps(body_data).encode("utf-8")
-    url = completion_url(base_url, api_format)
-    payload = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    final_text = ""
+    usage: dict = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
-            with urllib.request.urlopen(request, timeout=240) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as error:
-            details = error.read().decode("utf-8", errors="replace").strip()
-            message = _compact_upstream_error(details, error.reason)
-            retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
-            if attempt < MAX_ATTEMPTS and error.code in RETRYABLE_STATUS:
-                time.sleep(RETRY_BASE_DELAY * attempt + random.uniform(0, 0.5))
-                continue
-            raise RuntimeError(f"HTTP {error.code}: {message}{retried}") from error
-        except urllib.error.URLError as error:
-            reason = getattr(error, "reason", str(error))
-            if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BASE_DELAY * attempt + random.uniform(0, 0.5))
-                continue
-            retried = f"（已自动重试 {attempt - 1} 次）" if attempt > 1 else ""
-            raise RuntimeError(f"无法连接接口：{reason}{retried}") from error
-    if payload is None:
-        raise RuntimeError("接口未返回有效 JSON")
-    if api_format == "anthropic":
-        content = "".join(
-            block.get("text", "")
-            for block in payload.get("content", [])
-            if block.get("type") == "text"
-        )
-        stop_reason = payload.get("stop_reason")
-        if stop_reason == "refusal":
-            raise RuntimeError("模型拒绝生成，本次回答不计入")
-        if stop_reason == "max_tokens":
-            raise RuntimeError("回答因 max_tokens 截断，本次回答不计入")
-    else:
-        choice = payload["choices"][0]
-        content = choice["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") for part in content)
-        if choice.get("finish_reason") in {"length", "content_filter"}:
-            raise RuntimeError(
-                f"回答未正常完成（{choice['finish_reason']}），本次回答不计入"
-            )
-    return str(content)
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message":
+                final_text = item.get("text", final_text)
+        elif event.get("type") == "turn.completed":
+            usage = event.get("usage") or {}
+    return final_text, usage, elapsed
 
 
-def request_completion(
-    base_url: str,
-    api_key: str,
-    api_model: str,
-    prompt: str,
-    temperature: float | None,
-    api_format: str = "auto",
-    system_prompt: str = "",
-) -> str:
-    if api_format != "auto":
-        return _request_completion(
-            base_url, api_key, api_model, prompt, temperature, api_format, system_prompt
-        )
-    formats = ("openai", "anthropic")
-    errors = []
-    for candidate in formats:
+# ---------------------------------------------------------------------------
+# 终端表格（显示宽度对齐）
+# ---------------------------------------------------------------------------
+
+
+def char_width(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def display_width(text: str) -> int:
+    return sum(char_width(c) for c in text)
+
+
+def pad(text: str, width: int, align: str) -> str:
+    gap = width - display_width(text)
+    if gap <= 0:
+        return text
+    if align == "right":
+        return " " * gap + text
+    if align == "center":
+        left = gap // 2
+        return " " * left + text + " " * (gap - left)
+    return text + " " * gap
+
+
+def render_table(headers: list[str], rows: list[list], aligns: list[str]) -> str:
+    str_rows = [[str(c) for c in row] for row in rows]
+    widths = [
+        max(display_width(headers[i]), *(display_width(r[i]) for r in str_rows))
+        if str_rows
+        else display_width(headers[i])
+        for i in range(len(headers))
+    ]
+
+    def fmt(cells: list[str]) -> str:
+        return "  ".join(pad(cells[i], widths[i], aligns[i]) for i in range(len(headers)))
+
+    lines = [fmt(headers), "  ".join("-" * w for w in widths)]
+    lines += [fmt(r) for r in str_rows]
+    return "\n".join(lines)
+
+
+def setup_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
         try:
-            return _request_completion(
-                base_url, api_key, api_model, prompt, temperature, candidate, system_prompt
-            )
-        except RuntimeError as error:
-            errors.append(f"{candidate}: {error}")
-    raise RuntimeError("接口格式自动探测失败；" + "；".join(errors))
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
-def test_automatic(
-    base_url: str,
-    api_key: str,
-    api_model: str,
-    temperature: float | None,
+# ---------------------------------------------------------------------------
+# 评测流程
+# ---------------------------------------------------------------------------
+
+
+def test_with_codex(
+    model: str | None,
+    effort: str,
+    target_count: int,
+    max_attempts: int,
     bank: dict,
-    api_format: str = "auto",
-    target_count: int = 3,
-    max_attempts: int | None = None,
     save_outputs: Path | None = None,
 ) -> dict:
-    if max_attempts is None:
-        max_attempts = max(target_count + 3, 6)
     challenges = generate_challenges(max_attempts)
-    outputs = []
-    raw_rows = []
-    errors = []
+    outputs: list[dict] = []
+    perf_rows: list[list] = []
+    raw_rows: list[dict] = []
+    errors: list[str] = []
+
+    headers = ["Run", "数字", "InTok", "OutTok", "ReTok", "Time(s)", "TPS", "状态"]
+    aligns = ["right", "right", "right", "right", "right", "right", "right", "center"]
+
+    def flush_table() -> None:
+        if perf_rows:
+            print(render_table(headers, perf_rows, aligns), flush=True)
+
     for index, challenge in enumerate(challenges, start=1):
         print(
-            f"[{index}/{max_attempts}] 请求挑战 {challenge['id']} "
+            f"[{index}/{max_attempts}] codex 挑战 {challenge['id']} "
             f"(期望约 {challenge['expected_count']} 个数)…",
             file=sys.stderr,
         )
         try:
-            text = request_completion(
-                base_url,
-                api_key,
-                api_model,
-                challenge["prompt"],
-                temperature,
-                api_format,
-            )
+            text, usage, elapsed = run_codex(challenge["prompt"], model, effort)
             minimum = max(80, math.ceil(challenge["expected_count"] * 0.55))
-            parsed_count = len(parse_numbers(text))
+            numbers = parse_numbers(text)
+            parsed_count = len(numbers)
             accepted = parsed_count >= minimum
+            out_tok = usage.get("output_tokens")
+            in_tok = usage.get("input_tokens")
+            rea_tok = usage.get("reasoning_output_tokens")
+            tps = (out_tok / elapsed) if out_tok and elapsed > 0 else None
             raw_rows.append(
                 {
                     "challenge_id": challenge["id"],
@@ -697,19 +638,35 @@ def test_automatic(
                     "parsed_numbers": parsed_count,
                     "minimum_numbers": minimum,
                     "accepted": accepted,
+                    "usage": usage,
+                    "latency_s": elapsed,
+                    "tps": tps,
                 }
             )
+            perf_rows.append(
+                [
+                    index,
+                    parsed_count,
+                    in_tok if in_tok is not None else "-",
+                    out_tok if out_tok is not None else "-",
+                    rea_tok if rea_tok is not None else "-",
+                    f"{elapsed:.1f}",
+                    f"{tps:.1f}" if tps else "-",
+                    "✓" if accepted else "✗",
+                ]
+            )
+            flush_table()
             if accepted:
                 outputs.append(
-                    {
-                        "text": text,
-                        "expected_count": challenge["expected_count"],
-                    }
+                    {"text": text, "expected_count": challenge["expected_count"]}
                 )
-                print(f"    接受：解析到 {parsed_count} 个数字", file=sys.stderr)
+                if tps:
+                    print(f"    接受：{parsed_count} 数字  TPS={tps:.1f}", file=sys.stderr)
+                else:
+                    print(f"    接受：{parsed_count} 数字", file=sys.stderr)
             else:
                 errors.append(f"有效数字不足：{parsed_count}/{minimum}")
-                print(f"    拒绝：解析到 {parsed_count}/{minimum}", file=sys.stderr)
+                print(f"    拒绝：{parsed_count}/{minimum}", file=sys.stderr)
         except Exception as error:
             errors.append(str(error))
             raw_rows.append(
@@ -721,15 +678,49 @@ def test_automatic(
                     "error": str(error),
                 }
             )
+            perf_rows.append([index, "-", "-", "-", "-", "-", "-", "ERR"])
+            flush_table()
             print(f"    失败：{error}", file=sys.stderr)
         if len(outputs) == target_count:
             break
+
+    # 汇总 token / 耗时 / TPS
+    ok_rows = [row for row in raw_rows if row.get("accepted") and row.get("usage")]
+    total_out = sum((row["usage"] or {}).get("output_tokens") or 0 for row in ok_rows)
+    total_in = sum((row["usage"] or {}).get("input_tokens") or 0 for row in ok_rows)
+    total_re = sum((row["usage"] or {}).get("reasoning_output_tokens") or 0 for row in ok_rows)
+    total_time = sum(row.get("latency_s") or 0.0 for row in ok_rows)
+    avg_tps = (total_out / total_time) if total_out and total_time > 0 else None
+    performance = {
+        "runs": [
+            {
+                "challenge_id": row.get("challenge_id"),
+                "parsed_numbers": row.get("parsed_numbers"),
+                "accepted": row.get("accepted"),
+                "latency_s": row.get("latency_s"),
+                "tps": row.get("tps"),
+                "usage": row.get("usage") or {},
+            }
+            for row in raw_rows
+        ],
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "reasoning_output_tokens": total_re,
+        "latency_s": total_time,
+        "tps": avg_tps,
+    }
+    summary = f"\n性能汇总: OutTok={total_out}  ReTok={total_re}  Time={total_time:.1f}s"
+    if avg_tps is not None:
+        summary += f"  TPS={avg_tps:.1f}"
+    print(summary, flush=True)
+
     if save_outputs is not None:
         save_outputs.parent.mkdir(parents=True, exist_ok=True)
         with save_outputs.open("w", encoding="utf-8") as handle:
             for row in raw_rows:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"原始输出已写入: {save_outputs}", file=sys.stderr)
+
     result = analyze_global_outputs(outputs, bank)
     result["api_test"] = {
         "requested": target_count,
@@ -737,36 +728,10 @@ def test_automatic(
         "max_attempts": max_attempts,
         "received": len(outputs),
         "errors": errors,
+        "runner": "codex-cli",
     }
+    result["performance"] = performance
     return result
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def resolve_credentials(args: argparse.Namespace) -> tuple[str, str, str]:
-    base_url = (
-        args.base_url
-        or os.environ.get("MODELTRACE_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENAI_API_BASE")
-        or ""
-    ).strip()
-    api_key = (
-        args.api_key
-        or os.environ.get("MODELTRACE_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or ""
-    ).strip()
-    model = (
-        args.model
-        or os.environ.get("MODELTRACE_MODEL")
-        or os.environ.get("OPENAI_MODEL")
-        or ""
-    ).strip()
-    return base_url, api_key, model
 
 
 def split_manual_outputs(pasted: str) -> list[dict]:
@@ -786,18 +751,24 @@ def format_report(result: dict, top: int = 8) -> str:
     lines.append("ModelTrace 归因结果")
     lines.append("=" * 56)
     lines.append(
-        f"预测模型: {result['prediction_name']}  "
-        f"P={result['probability']:.1%}"
+        f"预测模型: {result['prediction_name']}  P={result['probability']:.1%}"
     )
     lines.append(
-        f"预测家族: {result['family_prediction_name']}  "
-        f"P={result['family_probability']:.1%}"
+        f"预测家族: {result['family_prediction_name']}  P={result['family_probability']:.1%}"
     )
     lines.append(
         f"有效回答: {result['used_outputs']}  "
         f"校准: β={result['calibration']['beta']:.3f} "
         f"CV={result['calibration']['cv_accuracy']}"
     )
+    perf = result.get("performance") or {}
+    if perf:
+        tps = perf.get("tps")
+        base = (
+            f"输出 token: {perf.get('output_tokens', 0)}  "
+            f"耗时: {perf.get('latency_s', 0):.1f}s"
+        )
+        lines.append(base + (f"  TPS: {tps:.1f}" if tps is not None else ""))
     lines.append("")
     lines.append(f"{'模型':<28} {'概率':>8} {'家族内':>8} {'相似度':>8}")
     lines.append("-" * 56)
@@ -816,7 +787,7 @@ def format_report(result: dict, top: int = 8) -> str:
         api = result["api_test"]
         lines.append("")
         lines.append(
-            f"API 测试: 成功 {api['received']}/{api['requested']} "
+            f"测试: 成功 {api['received']}/{api['requested']} "
             f"(尝试 {api['attempted']}/{api['max_attempts']})"
         )
         for err in api.get("errors", [])[:5]:
@@ -830,18 +801,16 @@ def format_report(result: dict, top: int = 8) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="modeltrace_cli.py",
-        description="ModelTrace 终端在线评测：长整数挑战 + 统一指纹库模型归因",
+        description="ModelTrace 终端归因（本地 codex CLI）：输出 token / 耗时 / TPS",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 自动 API 测试（OpenAI 兼容）
-  python modeltrace_cli.py -m gpt-5.6-sol -u https://api.example.com/v1 -k sk-xxx
+  # 直接用本地 codex，无需配置 API
+  python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
 
-  # 环境变量方式（适合 wget 管道，避免 key 进 shell history）
-  export OPENAI_BASE_URL=https://api.example.com/v1
-  export OPENAI_API_KEY=sk-xxx
+  # 一键在线
   wget -qO- "https://raw.githubusercontent.com/you/repo/main/modeltrace_cli.py" \\
-    | python3 - -m gpt-5.6-sol
+    | python3 - -m gpt-5.6-sol -r medium -n 5
 
   # 手动模式：三份完整输出用 ===OUTPUT=== 分隔
   cat outputs.txt | python3 modeltrace_cli.py --manual
@@ -850,22 +819,26 @@ def build_parser() -> argparse.ArgumentParser:
   python3 modeltrace_cli.py -m gpt-5.6-sol --json
 """,
     )
-    parser.add_argument("-m", "--model", help="请求 API 时使用的模型名")
-    parser.add_argument("-u", "--base-url", help="OpenAI/Anthropic 兼容 Base URL")
-    parser.add_argument("-k", "--api-key", help="API Key（也可用环境变量）")
+    parser.add_argument("-m", "--model", help="Codex 模型名；省略则用本地默认")
+    parser.add_argument(
+        "-r",
+        "--reasoning-effort",
+        default="medium",
+        choices=["low", "medium", "high", "xhigh", "max", "ultra"],
+        help="推理强度（默认 medium）",
+    )
     parser.add_argument(
         "-n",
-        "--samples",
+        "--tests",
+        type=int,
+        default=5,
+        help="最多尝试几次挑战（默认 5，凑满 3 份有效回答即停）",
+    )
+    parser.add_argument(
+        "--target",
         type=int,
         default=3,
         help="目标有效回答数（默认 3，对应校准表）",
-    )
-    parser.add_argument("-t", "--temperature", type=float, default=None, help="采样温度")
-    parser.add_argument(
-        "--format",
-        choices=("auto", "openai", "anthropic"),
-        default="auto",
-        help="API 协议（默认 auto）",
     )
     parser.add_argument(
         "--manual",
@@ -878,12 +851,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank-file", type=Path, help="本地指纹库 JSON 路径")
     parser.add_argument("--cache-dir", type=Path, help="指纹库缓存目录")
     parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=None,
-        help="自动模式最多发起几次挑战（默认 max(n+3, 6)）",
-    )
-    parser.add_argument(
         "--save-outputs",
         type=Path,
         help="把原始模型输出存成 JSONL，便于复测/手动归因",
@@ -892,6 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    setup_console()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -904,12 +872,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误: {error}", file=sys.stderr)
         return 1
 
-    base_url, api_key, model = resolve_credentials(args)
-    has_api = bool(base_url and api_key and model)
-
     try:
-        if args.manual or (not has_api and not sys.stdin.isatty() and not (args.model or args.base_url)):
-            if sys.stdin.isatty() and args.manual:
+        # 手动：显式 --manual；或未指定 -m 且 stdin 是管道（兼容 < outputs.txt）
+        use_manual = args.manual or (args.model is None and not sys.stdin.isatty())
+        if use_manual:
+            if args.manual and sys.stdin.isatty():
                 print(
                     "手动模式：粘贴完整输出，多份用 ===OUTPUT=== 分隔，EOF 结束：",
                     file=sys.stderr,
@@ -918,24 +885,14 @@ def main(argv: list[str] | None = None) -> int:
             outputs = split_manual_outputs(pasted)
             result = analyze_global_outputs(outputs, bank)
         else:
-            if not has_api:
-                parser.error(
-                    "自动模式需要 base-url / api-key / model。\n"
-                    "可用参数 -u -k -m，或环境变量 "
-                    "OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL "
-                    "（或 MODELTRACE_*）。"
-                )
-            if args.samples < 1:
-                parser.error("-n/--samples 至少为 1")
-            result = test_automatic(
-                base_url=base_url,
-                api_key=api_key,
-                api_model=model,
-                temperature=args.temperature,
+            if args.target < 1 or args.tests < 1:
+                parser.error("-n/--tests 与 --target 至少为 1")
+            result = test_with_codex(
+                model=args.model,
+                effort=args.reasoning_effort,
+                target_count=args.target,
+                max_attempts=max(args.tests, args.target),
                 bank=bank,
-                api_format=args.format,
-                target_count=args.samples,
-                max_attempts=args.max_attempts,
                 save_outputs=args.save_outputs,
             )
     except Exception as error:
