@@ -909,9 +909,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-r",
         "--reasoning-effort",
-        default="medium",
+        default="low",
         choices=["low", "medium", "high", "xhigh", "max", "ultra"],
-        help="推理强度（默认 medium）",
+        help="推理强度（默认 low）",
     )
     parser.add_argument(
         "-n",
