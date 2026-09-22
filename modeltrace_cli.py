@@ -889,14 +889,14 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 示例:
   # 直接用本地 codex，默认并发 3 路，无需配置 API
-  python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
+  python modeltrace_cli.py -m gpt-5.6-sol -r medium
 
-  # 调整并行数
-  python modeltrace_cli.py -m gpt-5.6-sol -c 3 -n 6
+  # 调整并行数 / 尝试次数
+  python modeltrace_cli.py -m gpt-5.6-sol -c 3 -n 3
 
   # 一键在线
   wget -qO- "https://raw.githubusercontent.com/you/repo/main/modeltrace_cli.py" \\
-    | python3 - -m gpt-5.6-sol -r medium -n 5
+    | python3 - -m gpt-5.6-sol -r medium
 
   # 手动模式：三份完整输出用 ===OUTPUT=== 分隔
   cat outputs.txt | python3 modeltrace_cli.py --manual
@@ -917,8 +917,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-n",
         "--tests",
         type=int,
-        default=5,
-        help="最多尝试几次挑战（默认 5，凑满 3 份有效回答即停）",
+        default=3,
+        help="最多尝试几次挑战（默认 3，并发打完即止）",
     )
     parser.add_argument(
         "-c",
