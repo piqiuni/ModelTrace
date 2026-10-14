@@ -13,7 +13,7 @@
 不需要配置 API base-url / key。
 
 说明：
-- 默认使用仓库最新指纹库；单文件运行从 GitHub raw 拉取。
+- 默认每次从 GitHub raw 拉取最新指纹库。
 - 显式 --bank-url 优先远端；--backend api 使用 modeltrace_api.py。
 - 结果仅供参考；未收录模型仍会归到最相似候选。
 - 不建议在强系统提示环境里测（原项目说明）。
@@ -447,11 +447,7 @@ def default_cache_dir() -> Path:
 def load_bank(bank_url: str | None = None, cache_dir: Path | None = None) -> dict:
     cache_dir = cache_dir or default_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    if bank_url is None:
-        bundled = Path(__file__).resolve().parent / "data" / "unified_bank.json"
-        if bundled.exists():
-            return json.loads(bundled.read_text(encoding="utf-8"))
-        bank_url = BANK_URL_DEFAULT
+    bank_url = bank_url or BANK_URL_DEFAULT
     local = cache_dir / (hashlib.sha256(bank_url.encode()).hexdigest() + ".json")
     try:
         with urllib.request.urlopen(bank_url, timeout=60) as response:
@@ -467,7 +463,7 @@ def load_bank(bank_url: str | None = None, cache_dir: Path | None = None) -> dic
     except Exception:
         raise RuntimeError(
             "无法获取远端指纹库（原始错误已隐藏）。\n"
-            f"可手动下载到 {local}，或用 --bank-url / --bank-file 指定。"
+            "可用 --bank-file 指定离线库，或用 --bank-url 指定其他远端。"
         ) from None
 
 
@@ -792,7 +788,14 @@ def test_with_codex(
     wall_time = time.perf_counter() - wall_start
 
     # 汇总 token / 耗时 / TPS（按完成顺序展示；表内 Run 为挑战序号）
-    ok_rows = [row for row in raw_rows if row.get("accepted") and row.get("usage")]
+    accepted_rows = [row for row in raw_rows if row.get("accepted")]
+    ok_rows = [row for row in accepted_rows
+               if isinstance((row.get("usage") or {}).get("output_tokens"), int)
+               and not isinstance(row["usage"]["output_tokens"], bool)
+               and row["usage"]["output_tokens"] > 0]
+    missing_usage = len(accepted_rows) - len(ok_rows)
+    if missing_usage:
+        print(f"警告：{missing_usage}/{len(accepted_rows)} 份有效回答缺少正整数 output token usage；仅对 usage 完整的回答计算 TPS，不估算 token。", file=sys.stderr)
     total_out = sum((row["usage"] or {}).get("output_tokens") or 0 for row in ok_rows)
     total_in = sum((row["usage"] or {}).get("input_tokens") or 0 for row in ok_rows)
     total_re = sum((row["usage"] or {}).get("reasoning_output_tokens") or 0 for row in ok_rows)
@@ -815,21 +818,27 @@ def test_with_codex(
         ],
         "concurrency": concurrency,
         "input_tokens": total_in,
-        "output_tokens": total_out,
+        "output_tokens": total_out if ok_rows else None,
         "reasoning_output_tokens": total_re,
         "latency_s": sum_latency,
         "wall_time_s": wall_time,
         "tps": avg_tps,
         "wall_tps": wall_tps,
+        "usage_complete_runs": len(ok_rows),
+        "usage_missing_runs": missing_usage,
     }
     summary = (
-        f"\n性能汇总: OutTok={total_out}  ReTok={total_re}  "
+        f"\n性能汇总: OutTok={total_out if ok_rows else '未知'}  ReTok={total_re}  "
         f"并发={concurrency}  墙钟={wall_time:.1f}s  单请求耗时和={sum_latency:.1f}s"
     )
     if avg_tps is not None:
         summary += f"  单请求TPS={avg_tps:.1f}"
     if wall_tps is not None:
         summary += f"  吞吐TPS={wall_tps:.1f}"
+    if not ok_rows:
+        summary += "  TPS=不可用（上游未返回有效输出 token usage）"
+    elif missing_usage:
+        summary += "  TPS仅覆盖 usage 完整的回答，吞吐为已知 token 吞吐"
     print(summary, file=sys.stderr, flush=True)
 
     if save_outputs is not None:
@@ -894,6 +903,9 @@ def format_report(result: dict, top: int = 8) -> str:
             base += f"  单请求TPS: {tps:.1f}"
         if wall_tps is not None:
             base += f"  吞吐TPS: {wall_tps:.1f}"
+        if perf.get("usage_missing_runs"):
+            base += f"  缺少usage: {perf['usage_missing_runs']}份"
+            base += "  TPS不可用" if tps is None else "  TPS仅统计usage完整的回答"
         lines.append(base)
     lines.append("")
     lines.append(f"{'模型':<28} {'概率':>8} {'家族内':>8} {'相似度':>8}")

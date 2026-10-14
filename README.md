@@ -32,11 +32,11 @@ python3 modeltrace_cli.py --backend api --api-format chat -m your-model --save-o
 python3 modeltrace_cli.py -m your-model --bank-url https://raw.githubusercontent.com/xqy2006/ModelTrace/main/data/unified_bank.json
 ```
 
-默认使用当前 checkout 的 `data/unified_bank.json`，单文件运行时下载官方库。`--bank-file` 可指定离线库，与 `--bank-url` 互斥。远端库按 URL 分别缓存，显式 URL 下载失败会报错，不会静默回退到旧库。
+默认每次运行均下载官方远端指纹库，不优先采用 checkout 或旧缓存。`--bank-file` 可指定离线库，与 `--bank-url` 互斥。远端库按 URL 分别缓存，显式 URL 下载失败会报错，不会静默回退到旧库。
 
 Codex 在临时目录中运行，以 `--json` 审计全部事件；发现工具调用、未知项目、损坏事件或不完整结束时拒绝该回答，超时后终止进程树。审计能发现已发生的工具调用，不等于从根本上禁用 Codex 工具。API 模式不提供或执行工具，拒绝返回工具调用或截断回答；禁止 HTTP 重定向以避免转发凭据。`--json` 的 stdout 仅包含结果 JSON，进度和性能表写入 stderr。
 
-`-n` 是最大尝试次数，`--target` 是目标有效回答数，`-c` 控制并发；如果 `-n` 小于目标则提升到目标次数。`--save-outputs` 保存逐轮原始回答与性能，不保存 API key；未达到目标时报告实际有效数量。闭集归因不能证明服务端真实模型身份，也无法观察服务端未披露的工具使用。
+`-n` 是最大尝试次数，`--target` 是目标有效回答数，`-c` 控制并发；如果 `-n` 小于目标则提升到目标次数。`--save-outputs` 保存逐轮原始回答与性能，不保存 API key；未达到目标时报告实际有效数量。上游缺少输出 token usage 时明确显示 TPS 不可用；部分回答缺少 usage 时，仅使用有有效 usage 的回答及其耗时计算单请求 TPS，吞吐为已知 token 吞吐，不估算 token。闭集归因不能证明服务端真实模型身份，也无法观察服务端未披露的工具使用。
 
 CLI 回归测试：`python3 -m unittest -v test_modeltrace_cli`（评分一致性测试需要 requirements 中的 NumPy）。
 

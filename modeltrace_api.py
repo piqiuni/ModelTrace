@@ -6,6 +6,26 @@ import urllib.request
 from urllib.parse import urlsplit
 
 
+def normalize_usage(usage):
+    usage = usage if isinstance(usage, dict) else {}
+    def count(*values):
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and value >= 0:
+                return value
+            if isinstance(value, str) and value.isascii() and value.isdigit():
+                return int(value)
+        return None
+    details = usage.get('output_tokens_details') or usage.get('completion_tokens_details') or {}
+    details = details if isinstance(details, dict) else {}
+    return {
+        'input_tokens': count(usage.get('input_tokens'), usage.get('prompt_tokens')),
+        'output_tokens': count(usage.get('output_tokens'), usage.get('completion_tokens')),
+        'reasoning_output_tokens': count(details.get('reasoning_tokens')),
+    }
+
+
 def run_api(prompt, model, base_url, api_key, api_format='chat', timeout=180):
     parsed = urlsplit(base_url)
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
@@ -67,9 +87,5 @@ def run_api(prompt, model, base_url, api_key, api_format='chat', timeout=180):
                 chunks.append(part['text'])
         text = '\n'.join(chunks)
     usage = data.get('usage') or {}
-    normalized = {
-        'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')),
-        'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')),
-        'reasoning_output_tokens': (usage.get('output_tokens_details') or usage.get('completion_tokens_details') or {}).get('reasoning_tokens'),
-    }
+    normalized = normalize_usage(usage)
     return text, normalized, time.perf_counter() - started

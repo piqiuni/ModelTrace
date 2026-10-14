@@ -5,10 +5,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import modeltrace_cli as cli
-from modeltrace_api import run_api
+from modeltrace_api import run_api, normalize_usage
 
 
 class CliTests(unittest.TestCase):
+    def test_usage_aliases(self):
+        self.assertEqual(normalize_usage({'output_tokens': None, 'completion_tokens': '123'})['output_tokens'], 123)
+        for value in [None, -1, True, 'bad', 1.2]:
+            self.assertIsNone(normalize_usage({'output_tokens': value})['output_tokens'])
+
+    def test_default_remote(self):
+        bank = json.loads(Path('data/unified_bank.json').read_text())
+        with tempfile.TemporaryDirectory() as tmp, patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(bank).encode())) as call:
+            cli.load_bank(cache_dir=Path(tmp))
+            call.assert_called_once_with(cli.BANK_URL_DEFAULT, timeout=60)
+
+    def test_missing_usage_performance(self):
+        bank = json.loads(Path('data/unified_bank.json').read_text())
+        text = ','.join(str((i * 79) % 355 + 1) for i in range(330))
+        for usages, expected_tps in [([{}, {}], None), ([{'output_tokens': 100}, {}], 50)]:
+            values = iter((text, usage, 2.0) for usage in usages)
+            with patch('sys.stderr', new=io.StringIO()):
+                result = cli.test_with_codex(None, 'low', 2, 2, bank, concurrency=1, runner=lambda prompt: next(values))
+            self.assertEqual(result['performance']['tps'], expected_tps)
+            self.assertEqual(result['performance']['usage_missing_runs'], 2 if expected_tps is None else 1)
+            if expected_tps is None:
+                self.assertIsNone(result['performance']['output_tokens'])
+
     def test_event_audit(self):
         events = [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '42'}},
                   {'type': 'turn.completed', 'usage': {'output_tokens': 1}}]
@@ -23,7 +46,7 @@ class CliTests(unittest.TestCase):
                 cli.audit_codex_events(raw)
 
     def test_explicit_remote_ignores_cache(self):
-        bank = cli.load_bank()
+        bank = json.loads(Path('data/unified_bank.json').read_text())
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, 'unified_bank.local.json').write_text('{}')
             with patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(bank).encode())) as call:
@@ -60,7 +83,7 @@ class CliTests(unittest.TestCase):
 
     def test_scorer_matches_main(self):
         from fingerprint import analyze_global_outputs
-        bank = cli.load_bank()
+        bank = json.loads(Path('data/unified_bank.json').read_text())
         numbers = [((i * 79) % 355) + 1 for i in range(310)]
         outputs = [{'text': ','.join(map(str, numbers)), 'expected_count': 310}]
         expected = analyze_global_outputs(outputs, bank)
