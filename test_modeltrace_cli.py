@@ -2,6 +2,7 @@ import io
 import json
 import tempfile
 import unittest
+import threading
 from pathlib import Path
 from unittest.mock import patch
 import modeltrace_cli as cli
@@ -9,6 +10,39 @@ from modeltrace_api import run_api, normalize_usage
 
 
 class CliTests(unittest.TestCase):
+    def test_parallel_scheduling(self):
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args([]).concurrency, 1)
+        for flag in ['--parallel', '--concurrency', '-c']:
+            self.assertEqual(parser.parse_args([flag, '3']).concurrency, 3)
+        bank = json.loads(Path('data/unified_bank.json').read_text())
+        text = ','.join(str((i * 79) % 355 + 1) for i in range(330))
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        barrier = threading.Barrier(3, timeout=5)
+        def parallel_runner(prompt):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            barrier.wait()
+            with lock:
+                active -= 1
+            return text, {'output_tokens': 100}, 1.0
+        with patch('sys.stderr', new=io.StringIO()):
+            result = cli.test_with_codex(None, 'low', 3, 3, bank, concurrency=3, runner=parallel_runner)
+        self.assertEqual(peak, 3)
+        self.assertEqual(result['api_test']['received'], 3)
+        threads = set()
+        def serial_runner(prompt):
+            threads.add(threading.get_ident())
+            return text, {'output_tokens': 100}, 1.0
+        with patch('sys.stderr', new=io.StringIO()):
+            result = cli.test_with_codex(None, 'low', 3, 3, bank, runner=serial_runner)
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(result['performance']['concurrency'], 1)
+
     def test_usage_aliases(self):
         self.assertEqual(normalize_usage({'output_tokens': None, 'completion_tokens': '123'})['output_tokens'], 123)
         for value in [None, -1, True, 'bad', 1.2]:

@@ -8,7 +8,7 @@
 
     python modeltrace_cli.py -m gpt-5.6-sol -r medium -n 5
 
-默认**并发**调用本机 `codex exec`（并行 3 个请求，可用 -c 调整），发长整数挑战，
+默认串行调用本机 `codex exec`（用 --parallel N 或 -c N 开启并行），发长整数挑战，
 用官方 unified_bank 做闭集归因，并输出每轮输出 token / 耗时 / TPS。
 不需要配置 API base-url / key。
 
@@ -683,7 +683,7 @@ def test_with_codex(
     target_count: int,
     max_attempts: int,
     bank: dict,
-    concurrency: int = 3,
+    concurrency: int = 1,
     save_outputs: Path | None = None,
     runner=None,
     runner_name: str = "codex",
@@ -943,7 +943,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 直接用本地 codex，默认并发 3 路，无需配置 API
+  # 直接用本地 codex，默认串行，无需配置 API
   python modeltrace_cli.py -m gpt-5.6-sol -r medium
 
   # 调整并行数 / 尝试次数
@@ -973,14 +973,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--tests",
         type=int,
         default=3,
-        help="最多尝试几次挑战（默认 3，并发打完即止）",
+        help="最多尝试几次挑战（默认 3，达到目标有效回答数即止）",
     )
     parser.add_argument(
         "-c",
         "--concurrency",
+        "--parallel",
         type=int,
-        default=3,
-        help="并行 codex 请求数（默认 3）",
+        default=1,
+        help="Codex/API 同时请求数（默认 1，串行；--parallel 3 开启三路并行）",
     )
     parser.add_argument(
         "--target",

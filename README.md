@@ -16,7 +16,7 @@ python start.py
 CLI 的归因计算与 API 调用仅使用 Python 标准库；Codex 模式需要本机安装 `codex`。
 
 ```bash
-# Codex 模式，三份有效回答，单次请求最长 180 秒
+# Codex 模式，默认串行，三份有效回答，单次请求最长 180 秒
 python3 modeltrace_cli.py -m claude-opus-5-5 --timeout 180
 
 # 纯 Python API 模式；key 推荐通过环境变量传入
@@ -25,6 +25,7 @@ export MODELTRACE_API_KEY='your-key'
 python3 modeltrace_cli.py --backend api --api-format responses -m claude-opus-5-5 --json
 
 # URL / key 也可使用 --base-url / --api-key（别名 --url / --key）
+# Codex 和 API 均可追加 --parallel 3 开启三路并行，默认同时请求数为 1
 # --api-format 支持 chat、responses、anthropic，默认 chat
 python3 modeltrace_cli.py --backend api --api-format chat -m your-model --save-outputs outputs.jsonl
 
