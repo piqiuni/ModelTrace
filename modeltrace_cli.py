@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ModelTrace 终端归因：调用本地 codex CLI，统计 token/耗时/TPS。
+"""ModelTrace 终端归因：支持本地 Codex 和纯 Python API，统计 token/耗时/TPS。
 
     wget -qO- "https://raw.githubusercontent.com/<you>/<repo>/main/modeltrace_cli.py" \
       | python3 - -m gpt-5.6-sol -r medium -n 5
@@ -13,7 +13,8 @@
 不需要配置 API base-url / key。
 
 说明：
-- 指纹库首次运行从 GitHub raw 拉取并缓存（约 0.7MB）。
+- 默认使用仓库最新指纹库；单文件运行从 GitHub raw 拉取。
+- 显式 --bank-url 优先远端；--backend api 使用 modeltrace_api.py。
 - 结果仅供参考；未收录模型仍会归到最相似候选。
 - 不建议在强系统提示环境里测（原项目说明）。
 """
@@ -21,6 +22,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import signal
+import tempfile
 import json
 import math
 import os
@@ -440,28 +444,31 @@ def default_cache_dir() -> Path:
     return Path.home() / ".cache" / "modeltrace"
 
 
-def load_bank(bank_url: str = BANK_URL_DEFAULT, cache_dir: Path | None = None) -> dict:
+def load_bank(bank_url: str | None = None, cache_dir: Path | None = None) -> dict:
     cache_dir = cache_dir or default_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    local = cache_dir / "unified_bank.json"
-    local_bank = cache_dir / "unified_bank.local.json"
-    for path in (local_bank, local):
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                continue
+    if bank_url is None:
+        bundled = Path(__file__).resolve().parent / "data" / "unified_bank.json"
+        if bundled.exists():
+            return json.loads(bundled.read_text(encoding="utf-8"))
+        bank_url = BANK_URL_DEFAULT
+    local = cache_dir / (hashlib.sha256(bank_url.encode()).hexdigest() + ".json")
     try:
         with urllib.request.urlopen(bank_url, timeout=60) as response:
             raw = response.read()
         bank = json.loads(raw.decode("utf-8"))
-        local.write_text(json.dumps(bank, ensure_ascii=False), encoding="utf-8")
+        if not bank.get("models") or [m["id"] for m in bank["models"]] != bank["robust"]["model_order"]:
+            raise ValueError("指纹库结构错误")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache_dir, delete=False) as handle:
+            json.dump(bank, handle, ensure_ascii=False)
+            temporary = Path(handle.name)
+        temporary.replace(local)
         return bank
-    except Exception as error:
+    except Exception:
         raise RuntimeError(
-            f"无法获取指纹库：{error}\n"
+            "无法获取远端指纹库（原始错误已隐藏）。\n"
             f"可手动下载到 {local}，或用 --bank-url / --bank-file 指定。"
-        ) from error
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +490,7 @@ def resolve_codex_executable() -> str:
     raise RuntimeError("找不到 codex 可执行文件，请确认已安装并加入 PATH。")
 
 
-def run_codex(prompt: str, model: str | None, effort: str) -> tuple[str, dict, float]:
+def run_codex(prompt: str, model: str | None, effort: str, timeout: float = 180) -> tuple[str, dict, float]:
     """通过本地 codex exec 生成回答，返回 (文本, usage, 耗时秒)。"""
     exe = resolve_codex_executable()
     cmd = [
@@ -505,35 +512,68 @@ def run_codex(prompt: str, model: str | None, effort: str) -> tuple[str, dict, f
 
     start = time.perf_counter()
     # 多行题目走 stdin，避免 cmd 包装吞换行
-    proc = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    with tempfile.TemporaryDirectory(prefix="modeltrace-probe-") as cwd:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", cwd=cwd,
+            start_new_session=(os.name != "nt"),
+        )
+        try:
+            stdout, stderr = proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise RuntimeError(f"codex 超时（{timeout:g} 秒），已终止进程") from None
     elapsed = time.perf_counter() - start
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec failed")
+        raise RuntimeError("codex exec 失败（原始错误已隐藏）")
 
+    final_text, usage = audit_codex_events(stdout)
+    return final_text, usage, elapsed
+
+
+def audit_codex_events(stdout: str) -> tuple[str, dict]:
     final_text = ""
     usage: dict = {}
-    for line in proc.stdout.splitlines():
+    completed = False
+    for line in stdout.splitlines():
         line = line.strip()
-        if not line.startswith("{"):
+        if not line:
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            raise RuntimeError("Codex 事件流损坏，无法审计") from None
+        if event.get("type") not in {"thread.started", "turn.started", "turn.completed", "item.started", "item.updated", "item.completed"}:
+            raise RuntimeError("Codex 返回失败或未知事件")
+        if event.get("type", "").startswith("item."):
+            item = event.get("item") or {}
+            # Codex emits this advisory for custom provider models, before the turn.
+            metadata_warning = (
+                not completed and not final_text
+                and item.get("type") == "error"
+                and re.fullmatch(
+                    r"Model metadata for `[^`]+` not found\. Defaulting to fallback metadata; this can degrade performance and cause issues\.",
+                    item.get("message", ""),
+                ) is not None
+            )
+            if metadata_warning:
+                continue
+            if item.get("type") not in {"agent_message", "reasoning"}:
+                raise RuntimeError("检测到工具调用或未知项目，拒绝本轮回答")
         if event.get("type") == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message":
                 final_text = item.get("text", final_text)
         elif event.get("type") == "turn.completed":
+            completed = True
             usage = event.get("usage") or {}
-    return final_text, usage, elapsed
+    if not completed or not final_text:
+        raise RuntimeError("Codex 未返回完整回答")
+    return final_text, usage
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +638,10 @@ def _run_one_challenge(
     challenge: dict,
     model: str | None,
     effort: str,
+    runner=None,
 ) -> dict:
     try:
-        text, usage, elapsed = run_codex(challenge["prompt"], model, effort)
+        text, usage, elapsed = (runner or (lambda prompt: run_codex(prompt, model, effort)))(challenge["prompt"])
         minimum = max(80, math.ceil(challenge["expected_count"] * 0.55))
         numbers = parse_numbers(text)
         parsed_count = len(numbers)
@@ -648,6 +689,8 @@ def test_with_codex(
     bank: dict,
     concurrency: int = 3,
     save_outputs: Path | None = None,
+    runner=None,
+    runner_name: str = "codex",
 ) -> dict:
     challenges = generate_challenges(max_attempts)
     concurrency = max(1, min(concurrency, max_attempts))
@@ -681,9 +724,9 @@ def test_with_codex(
         if not rows:
             return
         ordered = sorted(rows, key=lambda r: r["index"])
-        print(render_table(headers, [row_from(r) for r in ordered], aligns), flush=True)
+        print(render_table(headers, [row_from(r) for r in ordered], aligns), file=sys.stderr, flush=True)
 
-    print(f"并发启动 {concurrency} 个 codex 请求…", file=sys.stderr)
+    print(f"并发启动 {concurrency} 个 {runner_name} 请求…", file=sys.stderr)
     wall_start = time.perf_counter()
     challenge_iter = iter(enumerate(challenges, start=1))
     futures = {}
@@ -698,7 +741,7 @@ def test_with_codex(
             f"(期望约 {challenge['expected_count']} 个数)",
             file=sys.stderr,
         )
-        futures[pool.submit(_run_one_challenge, index, challenge, model, effort)] = index
+        futures[pool.submit(_run_one_challenge, index, challenge, model, effort, runner)] = index
         return True
 
     def maybe_fill(pool: ThreadPoolExecutor) -> None:
@@ -787,7 +830,7 @@ def test_with_codex(
         summary += f"  单请求TPS={avg_tps:.1f}"
     if wall_tps is not None:
         summary += f"  吞吐TPS={wall_tps:.1f}"
-    print(summary, flush=True)
+    print(summary, file=sys.stderr, flush=True)
 
     if save_outputs is not None:
         save_outputs.parent.mkdir(parents=True, exist_ok=True)
@@ -803,7 +846,7 @@ def test_with_codex(
         "max_attempts": max_attempts,
         "received": len(accepted_outputs),
         "errors": errors,
-        "runner": "codex-cli",
+        "runner": runner_name,
         "concurrency": concurrency,
     }
     result["performance"] = performance
@@ -884,7 +927,7 @@ def format_report(result: dict, top: int = 8) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="modeltrace_cli.py",
-        description="ModelTrace 终端归因（本地 codex CLI）：输出 token / 耗时 / TPS",
+        description="ModelTrace 终端归因（Codex / 纯 Python API）：输出 token / 耗时 / TPS",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -940,7 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="输出原始 JSON")
     parser.add_argument("--top", type=int, default=8, help="文本报告显示前 N 个候选")
-    parser.add_argument("--bank-url", default=BANK_URL_DEFAULT, help="指纹库 URL")
+    parser.add_argument("--bank-url", help="显式 URL 优先下载远端库")
     parser.add_argument("--bank-file", type=Path, help="本地指纹库 JSON 路径")
     parser.add_argument("--cache-dir", type=Path, help="指纹库缓存目录")
     parser.add_argument(
@@ -948,6 +991,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="把原始模型输出存成 JSONL，便于复测/手动归因",
     )
+    parser.add_argument("--backend", choices=["codex", "api"], default="codex")
+    parser.add_argument("--base-url", "--url", help="API 服务地址")
+    parser.add_argument("--api-key", "--key", help="API key；建议用 MODELTRACE_API_KEY 环境变量")
+    parser.add_argument("--api-format", choices=["chat", "responses", "anthropic"], default="chat")
+    parser.add_argument("--timeout", type=float, default=180, help="每次请求超时秒数")
     return parser
 
 
@@ -955,6 +1003,18 @@ def main(argv: list[str] | None = None) -> int:
     setup_console()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout 必须是有限正数")
+    if args.bank_file and args.bank_url:
+        parser.error("--bank-file 与 --bank-url 不能同时指定")
+    runner = lambda prompt: run_codex(prompt, args.model, args.reasoning_effort, args.timeout)
+    if args.backend == "api" and not args.manual:
+        from modeltrace_api import run_api
+        base_url = args.base_url or os.environ.get("MODELTRACE_BASE_URL")
+        api_key = args.api_key or os.environ.get("MODELTRACE_API_KEY")
+        if not base_url or not api_key or not args.model:
+            parser.error("API 模式需要 URL、key 和模型名")
+        runner = lambda prompt: run_api(prompt, args.model, base_url, api_key, args.api_format, args.timeout)
 
     try:
         if args.bank_file:
@@ -967,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # 手动：显式 --manual；或未指定 -m 且 stdin 是管道（兼容 < outputs.txt）
-        use_manual = args.manual or (args.model is None and not sys.stdin.isatty())
+        use_manual = args.manual or (args.backend == "codex" and args.model is None and not sys.stdin.isatty())
         if use_manual:
             if args.manual and sys.stdin.isatty():
                 print(
@@ -988,6 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
                 bank=bank,
                 concurrency=args.concurrency,
                 save_outputs=args.save_outputs,
+                runner=runner,
+                runner_name=args.backend,
             )
     except Exception as error:
         print(f"错误: {error}", file=sys.stderr)
